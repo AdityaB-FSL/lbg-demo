@@ -145,6 +145,7 @@ def init_state(loaded: pd.DataFrame) -> None:
     st.session_state.ai_consolidation_log = []
     st.session_state.ai_review_rules = _DEFAULT_AI_REVIEW_RULES
     st.session_state.last_ai_merge = None
+    st.session_state.ai_delete_actions = {}
 
 
 def save_snapshot(action_name: str, df: pd.DataFrame, report: dict[str, Any] | None = None) -> None:
@@ -962,6 +963,7 @@ def consolidate_rows_from_ai_decisions(
     preview_chunks: list[dict[str, Any]] = []
 
     for comp in components:
+        original_records = [{c: out.iloc[p][c] for c in out.columns} for p in comp]
         addr_keys = [_normalized_full_address_key(out, p) for p in comp]
         uniq_addr = set(addr_keys)
         n_distinct_addr = len(uniq_addr)
@@ -988,6 +990,7 @@ def consolidate_rows_from_ai_decisions(
                 "survivor_index": surv,
                 "latest_row_index": latest_pos,
                 "merged_record": merged_record,
+                "original_records": original_records,
                 "field_explanations": list(expl_lines),
             }
         )
@@ -1049,6 +1052,63 @@ def _merged_record_to_dataframe(merged: dict[str, Any], column_order: list[str])
     return pd.DataFrame([row])
 
 
+def _delete_action_key(cluster: list[int], row_index: int) -> str:
+    """Stable key for per-row delete actions in AI review previews."""
+    cluster_key = "_".join(str(x) for x in sorted(cluster))
+    return f"{cluster_key}:{row_index}"
+
+
+def _build_consolidation_preview_table(
+    *,
+    merged_record: dict[str, Any],
+    original_records: list[dict[str, Any]],
+    cluster: list[int],
+    column_order: list[str],
+) -> pd.DataFrame:
+    """Create final preview table: consolidated record + original records."""
+    rows: list[dict[str, Any]] = []
+    rows.append(
+        {
+            "_select": False,
+            "_record_type": "Consolidated",
+            "_delete_status": "kept",
+            "_source_row": "merged",
+            **{c: merged_record.get(c, "") for c in column_order},
+        }
+    )
+    actions = st.session_state.get("ai_delete_actions", {})
+    for pos, rec in zip(cluster, original_records):
+        action = str(actions.get(_delete_action_key(cluster, int(pos)), "kept") or "kept")
+        if action == "hard_deleted":
+            continue
+        rows.append(
+            {
+                "_select": False,
+                "_record_type": "Original",
+                "_delete_status": action,
+                "_source_row": int(pos),
+                **{c: rec.get(c, "") for c in column_order},
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _style_consolidation_preview(df: pd.DataFrame):
+    """Color consolidated and original rows distinctly for the read-only preview."""
+    def _row_style(row: pd.Series) -> list[str]:
+        rtype = str(row.get("_record_type") or "")
+        dstatus = str(row.get("_delete_status") or "kept")
+        if rtype == "Consolidated":
+            base = "background-color: #dcfce7; color: #14532d; font-weight: 600;"
+        elif dstatus == "soft_deleted":
+            base = "background-color: #fef3c7; color: #78350f;"
+        else:
+            base = "background-color: #eff6ff; color: #1e3a8a;"
+        return [base for _ in row.index]
+
+    return df.style.apply(_row_style, axis=1)
+
+
 def _build_ai_insight_bullets(
     field_explanations: list[str],
     decisions: pd.DataFrame | None,
@@ -1099,6 +1159,7 @@ def _render_merge_outcome_previews(
     show_full_merge_report: bool = False,
 ) -> None:
     """Show combined row(s), 3–5 AI insight bullets, field prefs in expander; full md only for batch when enabled."""
+    st.session_state.setdefault("ai_delete_actions", {})
     if not previews:
         if md.strip() and show_full_merge_report:
             with st.expander("📄 Full merge report", expanded=False):
@@ -1130,12 +1191,66 @@ def _render_merge_outcome_previews(
                 unsafe_allow_html=True,
             )
             merged = p.get("merged_record") or {}
-            subheading("📋 Combined record")
+            original_records = p.get("original_records") or []
+            cluster = [int(x) for x in (p.get("cluster") or [])]
+            subheading("📋 Final consolidation preview")
+            preview_df = _build_consolidation_preview_table(
+                merged_record=merged,
+                original_records=original_records,
+                cluster=cluster,
+                column_order=column_order,
+            )
+            preview_df["_source_row"] = preview_df["_source_row"].astype(str)
+            display_preview_df = preview_df.drop(columns=["_select"])
             st.dataframe(
-                _merged_record_to_dataframe(merged, column_order),
+                _style_consolidation_preview(display_preview_df),
                 width='stretch',
                 height=min(280, max(160, 80 + len(column_order) * 8)),
             )
+            subheading("✅ Select rows in table")
+            edited_preview_df = st.data_editor(
+                preview_df,
+                width='stretch',
+                height=min(240, max(140, 70 + len(column_order) * 6)),
+                hide_index=True,
+                disabled=[c for c in preview_df.columns if c != "_select"],
+                column_config={
+                    "_select": st.column_config.CheckboxColumn("Select"),
+                    "_record_type": st.column_config.TextColumn("Record type"),
+                    "_delete_status": st.column_config.TextColumn("Delete status"),
+                    "_source_row": st.column_config.TextColumn("Source row"),
+                },
+                key=f"editor_consolidation_preview_{i}_{'_'.join(str(x) for x in sorted(cluster))}",
+            )
+            if cluster:
+                selectable_originals = [int(x) for x in cluster if int(x) != int(p.get("survivor_index"))]
+                if selectable_originals:
+                    subheading("🗑️ Deletion controls")
+                    widget_caption(
+                        "Select rows directly in the table, then apply **soft delete** (retain for audit) or **hard delete** (hide from final preview)."
+                    )
+                    selected_rows = (
+                        edited_preview_df.loc[
+                            (edited_preview_df["_record_type"] == "Original")
+                            & (edited_preview_df["_select"] == True),
+                            "_source_row",
+                        ]
+                        .astype(int)
+                        .tolist()
+                    )
+                    btn_soft, btn_hard, btn_clear = st.columns(3)
+                    if btn_soft.button("Soft delete selected", key=f"btn_soft_delete_{i}", type="secondary"):
+                        for row_idx in selected_rows:
+                            st.session_state.ai_delete_actions[_delete_action_key(cluster, row_idx)] = "soft_deleted"
+                        st.rerun()
+                    if btn_hard.button("Hard delete selected", key=f"btn_hard_delete_{i}", type="secondary"):
+                        for row_idx in selected_rows:
+                            st.session_state.ai_delete_actions[_delete_action_key(cluster, row_idx)] = "hard_deleted"
+                        st.rerun()
+                    if btn_clear.button("Clear delete status", key=f"btn_clear_delete_{i}", type="secondary"):
+                        for row_idx in selectable_originals:
+                            st.session_state.ai_delete_actions.pop(_delete_action_key(cluster, row_idx), None)
+                        st.rerun()
             expl = p.get("field_explanations") or []
             insight_bullets = _build_ai_insight_bullets(expl, decisions, max_bullets=5)
             if insight_bullets:
@@ -1168,6 +1283,8 @@ def _set_last_ai_merge(
     show_full_merge_report: bool = False,
 ) -> None:
     """Store latest AI review outcome for the persistent results panel."""
+    # Delete actions are scoped to the latest AI run only.
+    st.session_state.ai_delete_actions = {}
     st.session_state.last_ai_merge = {
         "decisions": decisions,
         "previews": previews,
@@ -1184,7 +1301,7 @@ def _render_last_ai_merge_panel() -> None:
         return
 
     section_divider()
-    section_heading("✨ Final AI review result")
+    section_heading("✨ Latest AI review result")
     if lm.get("no_merge_reason") == "no_same_person":
         dec = lm.get("decisions")
         nb = _build_ai_insight_bullets([], dec if dec is not None else None, max_bullets=5)
@@ -1453,6 +1570,7 @@ def _render_data_quality_tab() -> None:
         st.session_state.group_ai_results = {}
         st.session_state.df_before_ai_consolidation = None
         st.session_state.ai_consolidation_log = []
+        st.session_state.ai_delete_actions = {}
         st.toast("Standardized, enriched, and dedupe candidates computed.", icon="✅")
     if bf3.button("↩️ Reset data", type="secondary", key="btn_reset"):
         st.session_state.df = st.session_state.original_df.copy(deep=True)
@@ -1465,6 +1583,7 @@ def _render_data_quality_tab() -> None:
         st.session_state.ai_consolidation_log = []
         st.session_state.ai_review_rules = _DEFAULT_AI_REVIEW_RULES
         st.session_state.last_ai_merge = None
+        st.session_state.ai_delete_actions = {}
         st.toast(f"Restored original {_DATA_CSV_PATH.name}.", icon="↩️")
 
     df_work = st.session_state.df
@@ -1511,6 +1630,7 @@ def _render_data_quality_tab() -> None:
             )
             st.session_state.group_ai_results = {}
             st.session_state.ai_consolidation_log = []
+            st.session_state.ai_delete_actions = {}
             st.toast("Reverted AI consolidation.", icon="↩️")
 
     log = st.session_state.get("ai_consolidation_log") or []
