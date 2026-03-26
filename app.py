@@ -1184,7 +1184,7 @@ def _render_last_ai_merge_panel() -> None:
         return
 
     section_divider()
-    section_heading("✨ Latest AI review result")
+    section_heading("✨ Final AI review result")
     if lm.get("no_merge_reason") == "no_same_person":
         dec = lm.get("decisions")
         nb = _build_ai_insight_bullets([], dec if dec is not None else None, max_bullets=5)
