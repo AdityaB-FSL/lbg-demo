@@ -1,0 +1,9 @@
+# Direct dependencies for app.py / agents.py / utilities.py (pinned for reproducibility).
+streamlit==1.55.0
+pandas==2.3.3
+Markdown==3.10.2
+langchain-core==1.2.22
+langchain-google-genai==4.2.1
+google-api-core==2.30.0
+python-dotenv==1.2.2
+python-Levenshtein==0.27.3
